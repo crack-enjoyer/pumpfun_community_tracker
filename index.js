@@ -7,7 +7,8 @@ const { URL }    = require('url');
 const open       = require('open');
 const fs         = require('fs');
 const path       = require('path');
-const { getCreatorHandle } = require('./parser');
+const { getCreatorHandle }       = require('./parser');
+const { startPolling, broadcast, loadSubs } = require('./telegram');
 
 // ─── ANSI colours ─────────────────────────────────────────────────────────────
 const c = {
@@ -23,8 +24,19 @@ const c = {
 };
 
 const WHITELIST_PATH = path.join(__dirname, 'whitelist.json');
+const CONFIG_PATH    = path.join(__dirname, 'config.json');
 
-// ─── Whitelist persistence ────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
+function loadConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+  catch { return { cli_enabled: true, telegram: { bot_token: '' } }; }
+}
+
+function saveConfig(cfg) {
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+// ─── Whitelist ────────────────────────────────────────────────────────────────
 function loadWhitelist() {
   try { return JSON.parse(fs.readFileSync(WHITELIST_PATH, 'utf8')); }
   catch { return []; }
@@ -35,10 +47,7 @@ function saveWhitelist(list) {
 }
 
 function normalise(h) { return h.replace(/^@/, '').toLowerCase(); }
-
-function isWhitelisted(handle, list) {
-  return list.some(h => normalise(h) === normalise(handle));
-}
+function isWhitelisted(handle, list) { return list.some(h => normalise(h) === normalise(handle)); }
 
 function addHandle(handle) {
   const list = loadWhitelist();
@@ -63,15 +72,22 @@ function removeHandle(handle) {
   catch { try { globalThis.fetch = require('node-fetch'); } catch {} }
 })();
 
+// ─── Sound ────────────────────────────────────────────────────────────────────
+function playAlert() {
+  process.stdout.write('\x07');
+  setTimeout(() => process.stdout.write('\x07'), 180);
+  setTimeout(() => process.stdout.write('\x07'), 360);
+}
+
 // ─── URI helpers ──────────────────────────────────────────────────────────────
 function mapToHttpGateway(uri) {
   if (!uri || typeof uri !== 'string') return null;
   uri = uri.trim().replace(/^https?:\/\/(www\.)?ipfs\.io\/ipfs\//i, 'https://dweb.link/ipfs/');
-  if (uri.startsWith('data:'))      return { type: 'data', value: uri };
-  if (uri.startsWith('ipfs://'))    { let p = uri.slice(7); if (p.startsWith('ipfs/')) p = p.slice(5); return { type: 'http', value: `https://dweb.link/ipfs/${p}` }; }
-  if (uri.startsWith('ipns://'))    return { type: 'http', value: `https://dweb.link/ipns/${uri.slice(7)}` };
+  if (uri.startsWith('data:'))         return { type: 'data', value: uri };
+  if (uri.startsWith('ipfs://'))       { let p = uri.slice(7); if (p.startsWith('ipfs/')) p = p.slice(5); return { type: 'http', value: `https://dweb.link/ipfs/${p}` }; }
+  if (uri.startsWith('ipns://'))       return { type: 'http', value: `https://dweb.link/ipns/${uri.slice(7)}` };
   if (uri.startsWith('ar://') || uri.startsWith('arweave://')) return { type: 'http', value: `https://arweave.net/${uri.replace(/^ar(?:weave)?:\/\//, '')}` };
-  if (uri.startsWith('/ipfs/'))     return { type: 'http', value: `https://dweb.link${uri}` };
+  if (uri.startsWith('/ipfs/'))        return { type: 'http', value: `https://dweb.link${uri}` };
   if (/^ipfs\/[A-Za-z0-9]/.test(uri)) return { type: 'http', value: `https://dweb.link/${uri}` };
   try { const u = new URL(uri); if (u.protocol === 'http:' || u.protocol === 'https:') return { type: 'http', value: uri }; } catch {}
   if (/^[a-zA-Z0-9_-]{43,}$/.test(uri)) return { type: 'http', value: `https://arweave.net/${uri}` };
@@ -107,7 +123,7 @@ async function fetchJsonFromUri(originalUri, opts = {}) {
 function findCommunitiesUrl(obj) {
   if (!obj) return null;
   if (typeof obj === 'string') return obj.includes('communities') ? obj : null;
-  if (Array.isArray(obj)) { for (const i of obj) { const r = findCommunitiesUrl(i); if (r) return r; } }
+  if (Array.isArray(obj))           { for (const i of obj) { const r = findCommunitiesUrl(i); if (r) return r; } }
   else if (typeof obj === 'object') { for (const v of Object.values(obj)) { const r = findCommunitiesUrl(v); if (r) return r; } }
   return null;
 }
@@ -135,14 +151,27 @@ function printBanner() {
   console.log(c.dim + '  pump.fun community token monitor\n' + c.reset);
 }
 
+function printStatusLine() {
+  const cfg      = loadConfig();
+  const cliLabel = cfg.cli_enabled ? `${c.green}on${c.reset}` : `${c.red}off${c.reset}`;
+  const tgOk     = cfg.telegram?.bot_token && cfg.telegram.bot_token !== 'YOUR_BOT_TOKEN_HERE';
+  const subCount = loadSubs().size;
+  const tgLabel  = tgOk
+    ? `${c.green}on${c.reset} ${c.dim}(${subCount} subscriber${subCount !== 1 ? 's' : ''})${c.reset}`
+    : `${c.dim}not configured${c.reset}`;
+  const wlCount  = loadWhitelist().length;
+  console.log(`  CLI ${cliLabel}  │  Telegram ${tgLabel}  │  Whitelist: ${wlCount} handle(s)\n`);
+}
+
 function printHelp() {
   console.log([
     `  ${c.bold}Commands${c.reset}`,
-    `  ${c.cyan}add <@handle>${c.reset}     Add handle to whitelist`,
-    `  ${c.cyan}remove <@handle>${c.reset}  Remove handle from whitelist`,
-    `  ${c.cyan}list${c.reset}              Show current whitelist`,
-    `  ${c.cyan}help${c.reset}              Show this message`,
-    `  ${c.cyan}exit${c.reset}              Quit`,
+    `  ${c.cyan}add <@handle>${c.reset}       Add handle to whitelist`,
+    `  ${c.cyan}remove <@handle>${c.reset}    Remove handle from whitelist`,
+    `  ${c.cyan}list${c.reset}                Show current whitelist`,
+    `  ${c.cyan}cli on|off${c.reset}          Enable / disable browser tab opening & sound`,
+    `  ${c.cyan}help${c.reset}                Show this message`,
+    `  ${c.cyan}exit${c.reset}                Quit`,
     '',
   ].join('\n'));
 }
@@ -166,9 +195,9 @@ function printAlert(mint, pairAddress, tokenName, handle, axiomUrl) {
   console.log(bar + '\n');
 }
 
-// ─── CLI input ────────────────────────────────────────────────────────────────
+// ─── CLI ──────────────────────────────────────────────────────────────────────
 const rl = readline.createInterface({
-  input: process.stdin,
+  input:  process.stdin,
   output: process.stdout,
   prompt: `${c.cyan}›${c.reset} `,
 });
@@ -176,7 +205,6 @@ const rl = readline.createInterface({
 function handleCommand(line) {
   const parts = line.trim().split(/\s+/);
   const cmd   = parts[0]?.toLowerCase();
-
   if (!cmd) { rl.prompt(); return; }
 
   switch (cmd) {
@@ -196,8 +224,19 @@ function handleCommand(line) {
     }
     case 'list': case 'ls':
       printWhitelist(); break;
-    case 'help':
-      printHelp(); break;
+    case 'cli': {
+      const arg = parts[1]?.toLowerCase();
+      if (arg !== 'on' && arg !== 'off') {
+        console.log(`  ${c.yellow}Usage: cli on|off${c.reset}`);
+      } else {
+        const cfg = loadConfig();
+        cfg.cli_enabled = arg === 'on';
+        saveConfig(cfg);
+        console.log(`  CLI ${cfg.cli_enabled ? `${c.green}enabled${c.reset}` : `${c.red}disabled${c.reset}`}`);
+      }
+      break;
+    }
+    case 'help':   printHelp(); break;
     case 'exit': case 'quit':
       console.log(`\n  ${c.dim}Goodbye.${c.reset}\n`);
       process.exit(0);
@@ -237,12 +276,20 @@ function startMonitor() {
 
     const pairAddress = bondingCurveKey ?? mint;
     const axiomUrl    = `https://axiom.trade/meme/${pairAddress}?chain=sol`;
+    const cfg         = loadConfig();
 
-    clearPromptLine();
-    printAlert(mint, pairAddress, name ?? 'Unknown', handle, axiomUrl);
-    rl.prompt(true);
+    // 1. CLI: sound + alert box + open tab
+    if (cfg.cli_enabled) {
+      clearPromptLine();
+      playAlert();
+      printAlert(mint, pairAddress, name ?? 'Unknown', handle, axiomUrl);
+      rl.prompt(true);
+      await open(axiomUrl).catch(() => {});
+    }
 
-    await open(axiomUrl).catch(() => {});
+    // 2. Telegram: broadcast to all subscribers
+    const token = cfg.telegram?.bot_token;
+    await broadcast(token, name ?? 'Unknown', mint, handle, axiomUrl);
   });
 
   ws.on('error', () => {});
@@ -252,9 +299,12 @@ function startMonitor() {
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 printBanner();
 if (!fs.existsSync(WHITELIST_PATH)) saveWhitelist([]);
+if (!fs.existsSync(CONFIG_PATH))    saveConfig(loadConfig());
 
-const wlCount = loadWhitelist().length;
-console.log(`  ${c.dim}Monitoring live tokens…  Whitelist: ${wlCount} handle(s)${c.reset}\n`);
+const { bot_token } = loadConfig().telegram ?? {};
+startPolling(bot_token); // background long-poll loop — never awaited
+
+printStatusLine();
 printHelp();
 
 startMonitor();
