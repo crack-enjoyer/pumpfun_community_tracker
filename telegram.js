@@ -1,7 +1,4 @@
 // filename: telegram.js
-// Self-contained Telegram module:
-//   - polls for /start and /stop commands to manage subscribers
-//   - broadcasts alerts to all subscribers in parallel
 'use strict';
 
 const fs   = require('fs');
@@ -32,22 +29,20 @@ async function tgCall(token, method, body = {}) {
 }
 
 // ─── Long-polling loop ────────────────────────────────────────────────────────
-// Runs forever in the background; resolves never (fire-and-forget)
 async function startPolling(token) {
   if (!token || token === 'YOUR_BOT_TOKEN_HERE') return;
 
   let offset = 0;
 
-  // eslint-disable-next-line no-constant-condition
   while (true) {
     const data = await tgCall(token, 'getUpdates', {
       offset,
-      timeout:         25,   // long-poll for up to 25 s
+      timeout:         25,
       allowed_updates: ['message'],
     });
 
     if (!data || !data.ok || !Array.isArray(data.result)) {
-      await new Promise(r => setTimeout(r, 5_000)); // back-off on error
+      await new Promise(r => setTimeout(r, 5_000));
       continue;
     }
 
@@ -101,18 +96,20 @@ async function startPolling(token) {
 }
 
 // ─── Broadcast ────────────────────────────────────────────────────────────────
-async function broadcast(token, tokenName, mint, handle, axiomUrl) {
+async function broadcast(token, tokenName, mint, handle, tag, axiomUrl) {
   if (!token || token === 'YOUR_BOT_TOKEN_HERE') return;
 
   const subs = loadSubs();
   if (subs.size === 0) return;
+
+  const tagLine = tag ? `<b>Tag:</b>    🏷 ${tag}\n` : '';
 
   const text = [
     `🚀 <b>Token Match</b>`,
     ``,
     `<b>Token:</b>  ${tokenName}`,
     `<b>Handle:</b> ${handle}`,
-    `<b>Mint:</b>   <code>${mint}</code>`,
+    `${tagLine}<b>Mint:</b>   <code>${mint}</code>`,
     ``,
     `<a href="${axiomUrl}">📈 Open on Axiom</a>`,
   ].join('\n');
