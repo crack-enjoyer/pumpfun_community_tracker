@@ -3,6 +3,7 @@
 
 const fs   = require('fs');
 const path = require('path');
+const { loadWhitelist, addHandle, tagHandle, removeHandle } = require('./whitelist');
 
 const SUBS_PATH = path.join(__dirname, 'subscribers.json');
 
@@ -28,6 +29,71 @@ async function tgCall(token, method, body = {}) {
   } catch { return null; }
 }
 
+async function reply(token, chatId, text) {
+  return tgCall(token, 'sendMessage', {
+    chat_id:                  chatId,
+    text,
+    parse_mode:               'HTML',
+    disable_web_page_preview: true,
+  });
+}
+
+// ─── Command handlers ─────────────────────────────────────────────────────────
+function handleHelp() {
+  return [
+    '<b>Token Monitor Bot</b>',
+    '',
+    '/start            — subscribe to alerts',
+    '/stop             — unsubscribe',
+    '/wl_add @handle [tag]  — add handle to whitelist',
+    '/wl_remove @handle     — remove handle',
+    '/wl_tag @handle [tag]  — set or clear a tag (omit tag to clear)',
+    '/wl_list               — show full whitelist',
+    '/help             — show this message',
+  ].join('\n');
+}
+
+function handleWlList() {
+  const list = loadWhitelist();
+  if (list.length === 0) return '📋 Whitelist is empty.';
+  const lines = list.map((e, i) => {
+    const tag = e.tag ? `  🏷 <i>${e.tag}</i>` : '';
+    return `${i + 1}. <code>${e.handle}</code>${tag}`;
+  });
+  return `📋 <b>Whitelist (${list.length})</b>\n\n` + lines.join('\n');
+}
+
+function handleWlAdd(parts) {
+  const handle = parts[1];
+  if (!handle) return '⚠️ Usage: /wl_add @handle [tag]';
+  const tag  = parts.slice(2).join(' ') || null;
+  const ok   = addHandle(handle, tag);
+  if (!ok) return `⚠️ <code>${handle}</code> is already in the whitelist.\nUse /wl_tag to update its tag.`;
+  const h      = handle.startsWith('@') ? handle : '@' + handle;
+  const tagStr = tag ? `  🏷 <i>${tag}</i>` : '';
+  return `✅ Added <code>${h}</code>${tagStr}`;
+}
+
+function handleWlRemove(parts) {
+  const handle = parts[1];
+  if (!handle) return '⚠️ Usage: /wl_remove @handle';
+  const ok = removeHandle(handle);
+  return ok
+    ? `🗑 Removed <code>${handle}</code>`
+    : `⚠️ <code>${handle}</code> not found in whitelist.`;
+}
+
+function handleWlTag(parts) {
+  const handle = parts[1];
+  if (!handle) return '⚠️ Usage: /wl_tag @handle [tag]';
+  const tag = parts.slice(2).join(' ') || null;
+  const ok  = tagHandle(handle, tag);
+  if (!ok) return `⚠️ <code>${handle}</code> not found in whitelist.`;
+  return tag
+    ? `🏷 Tag updated: <code>${handle}</code> → <i>${tag}</i>`
+    : `🏷 Tag cleared for <code>${handle}</code>`;
+}
+
 // ─── Long-polling loop ────────────────────────────────────────────────────────
 async function startPolling(token) {
   if (!token || token === 'YOUR_BOT_TOKEN_HERE') return;
@@ -49,66 +115,79 @@ async function startPolling(token) {
     for (const update of data.result) {
       offset = update.update_id + 1;
 
-      const msg  = update.message;
-      const text = msg?.text?.trim();
-      const id   = String(msg?.chat?.id ?? '');
-      const name = msg?.chat?.first_name ?? msg?.chat?.username ?? 'there';
+      const msg      = update.message;
+      const text     = msg?.text?.trim();
+      const chatId   = String(msg?.chat?.id ?? '');
+      const userName = msg?.chat?.first_name ?? msg?.chat?.username ?? 'there';
 
-      if (!text || !id) continue;
+      if (!text || !chatId) continue;
 
-      const subs = loadSubs();
+      const subs  = loadSubs();
+      // Strip optional @botname suffix from commands (e.g. /start@mybot)
+      const parts = text.split(/\s+/);
+      const cmd   = (parts[0] ?? '').replace(/@\S+$/, '').toLowerCase();
 
-      if (text.startsWith('/start')) {
-        if (!subs.has(id)) {
-          subs.add(id);
-          saveSubs(subs);
-          await tgCall(token, 'sendMessage', {
-            chat_id:    id,
-            text:       `👋 Hey ${name}! You're now subscribed to token alerts.\n\nSend /stop at any time to unsubscribe.`,
-            parse_mode: 'HTML',
-          });
-        } else {
-          await tgCall(token, 'sendMessage', {
-            chat_id:    id,
-            text:       `✅ You're already subscribed. Send /stop to unsubscribe.`,
-            parse_mode: 'HTML',
-          });
-        }
-      } else if (text.startsWith('/stop')) {
-        if (subs.has(id)) {
-          subs.delete(id);
-          saveSubs(subs);
-          await tgCall(token, 'sendMessage', {
-            chat_id:    id,
-            text:       `👋 You've been unsubscribed. Send /start to resubscribe anytime.`,
-            parse_mode: 'HTML',
-          });
-        } else {
-          await tgCall(token, 'sendMessage', {
-            chat_id:    id,
-            text:       `You're not currently subscribed. Send /start to subscribe.`,
-            parse_mode: 'HTML',
-          });
-        }
+      switch (cmd) {
+        case '/start':
+          if (!subs.has(chatId)) {
+            subs.add(chatId);
+            saveSubs(subs);
+            await reply(token, chatId,
+              `👋 Hey ${userName}! You're now subscribed to token alerts.\n\nSend /stop to unsubscribe or /help to see all commands.`
+            );
+          } else {
+            await reply(token, chatId, `✅ You're already subscribed. Send /stop to unsubscribe.`);
+          }
+          break;
+
+        case '/stop':
+          if (subs.has(chatId)) {
+            subs.delete(chatId);
+            saveSubs(subs);
+            await reply(token, chatId, `👋 Unsubscribed. Send /start to resubscribe anytime.`);
+          } else {
+            await reply(token, chatId, `You're not subscribed. Send /start to subscribe.`);
+          }
+          break;
+
+        case '/help':
+          await reply(token, chatId, handleHelp());
+          break;
+
+        case '/wl_list':
+          await reply(token, chatId, handleWlList());
+          break;
+
+        case '/wl_add':
+          await reply(token, chatId, handleWlAdd(parts));
+          break;
+
+        case '/wl_remove':
+          await reply(token, chatId, handleWlRemove(parts));
+          break;
+
+        case '/wl_tag':
+          await reply(token, chatId, handleWlTag(parts));
+          break;
       }
     }
   }
 }
 
-// ─── Broadcast ────────────────────────────────────────────────────────────────
+// ─── Broadcast alert to all subscribers ──────────────────────────────────────
 async function broadcast(token, tokenName, mint, handle, tag, axiomUrl) {
   if (!token || token === 'YOUR_BOT_TOKEN_HERE') return;
 
   const subs = loadSubs();
   if (subs.size === 0) return;
 
-  const tagLine = tag ? `<b>Tag:</b>    🏷 ${tag}\n` : '';
+  const tagLine = tag ? `<b>Tag:</b>    🏷 <i>${tag}</i>\n` : '';
 
   const text = [
     `🚀 <b>Token Match</b>`,
     ``,
     `<b>Token:</b>  ${tokenName}`,
-    `<b>Handle:</b> ${handle}`,
+    `<b>Handle:</b> <code>${handle}</code>`,
     `${tagLine}<b>Mint:</b>   <code>${mint}</code>`,
     ``,
     `<a href="${axiomUrl}">📈 Open on Axiom</a>`,

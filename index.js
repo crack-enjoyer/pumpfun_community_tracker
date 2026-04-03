@@ -32,8 +32,9 @@ const { URL }    = require('url');
 const open       = require('open');
 const fs         = require('fs');
 const path       = require('path');
-const { getCreatorHandle }                   = require('./parser');
-const { startPolling, broadcast, loadSubs }  = require('./telegram');
+const { getCreatorHandle }                                          = require('./parser');
+const { startPolling, broadcast, loadSubs }                         = require('./telegram');
+const { loadWhitelist, saveWhitelist, normalise, findEntry, isWhitelisted, addHandle, tagHandle, removeHandle } = require('./whitelist');
 
 // ─── ANSI colours ─────────────────────────────────────────────────────────────
 const c = {
@@ -49,7 +50,6 @@ const c = {
   bgGreen: '\x1b[42m\x1b[30m',
 };
 
-const WHITELIST_PATH = path.join(__dirname, 'whitelist.json');
 const CONFIG_PATH    = path.join(__dirname, 'config.json');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -62,54 +62,6 @@ function saveConfig(cfg) {
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-// ─── Whitelist ────────────────────────────────────────────────────────────────
-function loadWhitelist() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(WHITELIST_PATH, 'utf8'));
-    return raw.map(entry =>
-      typeof entry === 'string'
-        ? { handle: entry, tag: null }
-        : { handle: entry.handle, tag: entry.tag ?? null }
-    );
-  } catch { return []; }
-}
-
-function saveWhitelist(list) {
-  fs.writeFileSync(WHITELIST_PATH, JSON.stringify(list, null, 2));
-}
-
-function normalise(h) { return h.replace(/^@/, '').toLowerCase(); }
-
-function findEntry(handle, list) {
-  return list.find(e => normalise(e.handle) === normalise(handle)) ?? null;
-}
-
-function isWhitelisted(handle, list) { return !!findEntry(handle, list); }
-
-function addHandle(handle, tag = null) {
-  const list = loadWhitelist();
-  if (findEntry(handle, list)) return false;
-  list.push({ handle: handle.startsWith('@') ? handle : '@' + handle, tag });
-  saveWhitelist(list);
-  return true;
-}
-
-function tagHandle(handle, tag) {
-  const list  = loadWhitelist();
-  const entry = findEntry(handle, list);
-  if (!entry) return false;
-  entry.tag = tag || null;
-  saveWhitelist(list);
-  return true;
-}
-
-function removeHandle(handle) {
-  const list = loadWhitelist();
-  const next = list.filter(e => normalise(e.handle) !== normalise(handle));
-  if (next.length === list.length) return false;
-  saveWhitelist(next);
-  return true;
-}
 
 // ─── fetch polyfill ───────────────────────────────────────────────────────────
 (async () => {
@@ -140,7 +92,39 @@ function mapToHttpGateway(uri) {
   return { type: 'unknown', value: uri };
 }
 
-const NETWORK_ERR_PATTERNS = ['ENOTFOUND', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'fetch failed', 'network', 'abort'];
+// ─── URI blocklist & failure cache ───────────────────────────────────────────
+// Patterns that are guaranteed to never contain useful metadata.
+const URI_BLOCKLIST = [
+  'default-metadata-placeholder',
+  'placeholder',
+  'undefined',
+  'null',
+  'example.com',
+  'test.com',
+];
+
+// Cache of URIs that failed recently — keyed by resolved URL, value = expiry ms.
+// Entries expire after 1 hour so transient failures don't block forever.
+const failedUriCache = new Map();
+const FAIL_TTL = 60 * 60 * 1_000; // 1 hour
+
+function isBlocklisted(url) {
+  const lower = url.toLowerCase();
+  return URI_BLOCKLIST.some(p => lower.includes(p));
+}
+
+function markFailed(url) {
+  failedUriCache.set(url, Date.now() + FAIL_TTL);
+}
+
+function isCachedFail(url) {
+  const expiry = failedUriCache.get(url);
+  if (!expiry) return false;
+  if (Date.now() > expiry) { failedUriCache.delete(url); return false; }
+  return true;
+}
+
+const NETWORK_ERR_PATTERNS = ['ENOTFOUND', 'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'fetch failed', 'network'];
 
 function isFetchRetryable(err) {
   const msg = (err?.message ?? '').toLowerCase();
@@ -157,28 +141,48 @@ async function fetchJsonFromUri(originalUri, opts = {}) {
   }
   if (info.type !== 'http') throw new Error(`Unsupported URI: ${originalUri}`);
 
-  const url      = info.value;
-  const BACKOFFS = [0, 5_000, 15_000, 30_000, 60_000];
-  const max      = 5;
+  const url = info.value;
+
+  // Fast-fail: known-bad patterns
+  if (isBlocklisted(url)) throw new Error('URI is blocklisted');
+
+  // Fast-fail: recently failed URI
+  if (isCachedFail(url)) throw new Error('URI is in failure cache');
+
+  // Network errors get long backoffs (connection lost); endpoint errors fail fast.
+  // Max 3 attempts total — we won't wait 2 minutes for a dead arweave URL.
+  const BACKOFFS     = [0, 3_000, 10_000];
+  const NET_BACKOFFS = [0, 5_000, 15_000, 30_000, 60_000];
+  const max          = 3;
   let lastErr;
 
   for (let a = 1; a <= max; a++) {
-    const wait = BACKOFFS[a - 1] ?? 60_000;
+    const isNet  = lastErr ? isFetchRetryable(lastErr) : false;
+    const waits  = isNet ? NET_BACKOFFS : BACKOFFS;
+    const wait   = waits[a - 1] ?? 60_000;
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
     try {
       const ctrl = new AbortController();
-      const t = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 10_000);
+      const t = setTimeout(() => ctrl.abort(), opts.timeoutMs ?? 6_000);
       const res = await fetch(url, { signal: ctrl.signal, redirect: 'follow', headers: { 'User-Agent': 'metadata-fetcher/1' } });
       clearTimeout(t);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (!res.ok) {
+        // 404, 410, 403 etc. — dead endpoint, don't retry, cache it
+        markFailed(url);
+        throw new Error(`HTTP ${res.status}`);
+      }
       const text = await res.text();
       try { return JSON.parse(text); } catch { const m = text.match(/\{[\s\S]*\}/); if (m) return JSON.parse(m[0]); throw new Error('Not JSON'); }
     } catch (err) {
       lastErr = err;
-      const retryable = isFetchRetryable(err);
-      if (!retryable && a >= 2) throw err;
-      if (a === max) throw err;
-      log(`${ts()} ${c.dim}[Fetch] attempt ${a}/${max} failed: ${err.message} - retrying in ${BACKOFFS[a] / 1000}s...${c.reset}`);
+      // Already marked failed above — rethrow immediately
+      if (err.message.startsWith('HTTP ')) throw err;
+      // Abort (timeout) on a non-network error = dead endpoint, cache it
+      if (err.message === 'This operation was aborted' && !isFetchRetryable(err)) {
+        if (a >= 2) { markFailed(url); throw err; }
+      }
+      if (a === max) { markFailed(url); throw err; }
+      log(`${ts()} ${c.dim}[Fetch] attempt ${a}/${max} failed: ${err.message} — retrying in ${(waits[a] ?? 60_000) / 1000}s…${c.reset}`);
     }
   }
   throw lastErr;
@@ -374,6 +378,137 @@ function handleCommand(line) {
   rl.prompt();
 }
 
+// ─── Token processing queue ───────────────────────────────────────────────────
+// Tokens arrive faster than they can be processed (30/min, ~5s per scrape).
+// A simple queue ensures every token is processed in order, one at a time,
+// so Puppeteer never runs in parallel and nothing gets silently dropped.
+
+const tokenQueue   = [];
+let   queueRunning = false;
+
+function enqueue(event) {
+  tokenQueue.push(event);
+  if (tokenQueue.length > 1) {
+    log(`${ts()} ${c.gray}[Queue] depth: ${tokenQueue.length}${c.reset}`);
+  }
+  if (!queueRunning) drainQueue();
+}
+
+async function drainQueue() {
+  queueRunning = true;
+  while (tokenQueue.length > 0) {
+    const event = tokenQueue.shift();
+    try {
+      await processToken(event);
+    } catch (err) {
+      log(`${ts()} ${c.red}[Queue] Unhandled error processing token: ${err.message}${c.reset}`);
+    }
+  }
+  queueRunning = false;
+}
+
+async function processToken(event) {
+  const { uri, name, mint, bondingCurveKey } = event;
+  if (!uri) return;
+
+  // Fast-fail before even logging — no point showing tokens we'll immediately skip
+  const resolvedInfo = mapToHttpGateway(uri);
+  const resolvedUrl  = resolvedInfo?.value ?? uri;
+  if (isBlocklisted(resolvedUrl) || isCachedFail(resolvedUrl)) return;
+
+  log(`${ts()} ${c.cyan}[Token]${c.reset} ${name ?? 'Unknown'}  ${c.dim}${mint}${c.reset}`);
+  log(`${ts()} ${c.dim}        URI: ${uri}${c.reset}`);
+
+  let meta;
+  try {
+    meta = await fetchJsonFromUri(uri);
+  } catch (err) {
+    log(`${ts()} ${c.dim}        [Skip] Could not fetch URI — ${err.message}${c.reset}`);
+    return;
+  }
+
+  // ── Check 1: community page → scrape handle via Puppeteer ──────────────────
+  const communityUrl = findCommunitiesUrl(meta);
+
+  // ── Check 2: twitter field contains a plain x.com profile or tweet URL ──
+  // Extract the username directly from the URL — no scraping needed.
+  // Handles:  https://x.com/GoatGems
+  //           https://twitter.com/GoatGems
+  //           https://x.com/GoatGems/status/123456
+  const twitterHandle = extractXHandle(meta);
+
+  if (!communityUrl && !twitterHandle) {
+    log(`${ts()} ${c.dim}        [Skip] No community URL or Twitter handle in metadata${c.reset}`);
+    return;
+  }
+
+  const whitelist = loadWhitelist();
+  let entry  = null;
+  let handle = null;
+  let matchSource = '';
+
+  // ── Twitter/X direct URL — checked first, no scraping needed ─────────────
+  if (twitterHandle) {
+    log(`${ts()} ${c.yellow}        [Twitter]${c.reset} Handle from URL: ${twitterHandle}`);
+    const found = findEntry(twitterHandle, whitelist);
+    if (found) { entry = found; handle = twitterHandle; matchSource = 'twitter'; }
+    else log(`${ts()} ${c.dim}        [Twitter] ${twitterHandle} not in whitelist${c.reset}`);
+  }
+
+  // ── Community path — only scrape if twitter check didn't already match ────
+  if (!entry && communityUrl) {
+    log(`${ts()} ${c.yellow}        [Community]${c.reset} ${communityUrl}`);
+    log(`${ts()} ${c.dim}        [Parser] Scraping handle…${c.reset}`);
+
+    let scraped;
+    try {
+      scraped = await getCreatorHandle(communityUrl);
+    } catch (err) {
+      const netErr = err?.message?.includes('ERR_NAME_NOT_RESOLVED') || err?.message?.includes('net::');
+      const hint   = netErr ? ' (network - all retries exhausted)' : '';
+      log(`${ts()} ${c.red}        [Parser] Failed${c.reset}${c.dim}${hint}: ${err.message}${c.reset}`);
+    }
+
+    if (scraped) {
+      log(`${ts()} ${c.dim}        [Parser] Handle: ${c.reset}${scraped}`);
+      const found = findEntry(scraped, whitelist);
+      if (found) { entry = found; handle = scraped; matchSource = 'community'; }
+      else log(`${ts()} ${c.dim}        [Community] ${scraped} not in whitelist${c.reset}`);
+    } else {
+      log(`${ts()} ${c.dim}        [Parser] No handle found${c.reset}`);
+    }
+  }
+
+  if (!entry) {
+    log(`${ts()} ${c.dim}        [Skip] No whitelisted handle found${c.reset}`);
+    return;
+  }
+
+  log(`${ts()} ${c.green}        [Match]${c.reset} ${handle} via ${matchSource}`);
+
+  const tag         = entry.tag ?? null;
+  const pairAddress = bondingCurveKey ?? mint;
+  const axiomUrl    = `https://axiom.trade/meme/${pairAddress}?chain=sol`;
+  const cfg         = loadConfig();
+
+  // 1. CLI: sound + alert + open tab
+  if (cfg.cli_enabled) {
+    clearPromptLine();
+    playAlert();
+    printAlert(mint, pairAddress, name ?? 'Unknown', handle, tag, axiomUrl);
+    rl.prompt(true);
+    await open(axiomUrl).catch(() => {});
+  }
+
+  // 2. Telegram broadcast
+  const token = cfg.telegram?.bot_token;
+  if (token && token !== 'YOUR_BOT_TOKEN_HERE') {
+    log(`${ts()} ${c.dim}        [Telegram] Broadcasting to ${loadSubs().size} subscriber(s)…${c.reset}`);
+    await broadcast(token, name ?? 'Unknown', mint, handle, tag, axiomUrl);
+    log(`${ts()} ${c.dim}        [Telegram] Sent${c.reset}`);
+  }
+}
+
 // ─── WebSocket monitor ────────────────────────────────────────────────────────
 function startMonitor() {
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
@@ -383,104 +518,14 @@ function startMonitor() {
     log(`${ts()} ${c.green}[WS]${c.reset} Connected — subscribed to new tokens`);
   });
 
-  ws.on('message', async (data) => {
+  ws.on('message', (data) => {
     let event;
     try { event = JSON.parse(data); } catch {
       log(`${ts()} ${c.red}[WS]${c.reset} Failed to parse message`);
       return;
     }
-
-    const { uri, name, mint, bondingCurveKey } = event;
-    if (!uri) return;
-
-    log(`${ts()} ${c.cyan}[Token]${c.reset} ${name ?? 'Unknown'}  ${c.dim}${mint}${c.reset}`);
-    log(`${ts()} ${c.dim}        URI: ${uri}${c.reset}`);
-
-    let meta;
-    try {
-      meta = await fetchJsonFromUri(uri);
-    } catch (err) {
-      log(`${ts()} ${c.dim}        [Skip] Could not fetch URI — ${err.message}${c.reset}`);
-      return;
-    }
-
-    const twitterHandle = extractXHandle(meta);
-    let communityUrl = null;
-
-    if (!twitterHandle) {
-      communityUrl = findCommunitiesUrl(meta);
-    }
-
-    if (!communityUrl && !twitterHandle) {
-      log(`${ts()} ${c.dim}        [Skip] No community URL or Twitter handle in metadata${c.reset}`);
-      return;
-    }
-
-    const whitelist = loadWhitelist();
-    let entry  = null;
-    let handle = null;
-    let matchSource = '';
-
-    // ── Community path ────────────────────────────────────────────────────────
-    if (communityUrl) {
-      log(`${ts()} ${c.yellow}        [Community]${c.reset} ${communityUrl}`);
-      log(`${ts()} ${c.dim}        [Parser] Scraping handle…${c.reset}`);
-
-      let scraped;
-      try {
-        scraped = await getCreatorHandle(communityUrl);
-      } catch (err) {
-        const netErr = err?.message?.includes('ERR_NAME_NOT_RESOLVED') || err?.message?.includes('net::');
-        const hint   = netErr ? ' (network - all retries exhausted)' : '';
-        log(`${ts()} ${c.red}        [Parser] Failed${c.reset}${c.dim}${hint}: ${err.message}${c.reset}`);
-      }
-
-      if (scraped) {
-        log(`${ts()} ${c.dim}        [Parser] Handle: ${c.reset}${scraped}`);
-        const found = findEntry(scraped, whitelist);
-        if (found) { entry = found; handle = scraped; matchSource = 'community'; }
-        else log(`${ts()} ${c.dim}        [Community] ${scraped} not in whitelist${c.reset}`);
-      } else if (!twitterHandle) {
-        log(`${ts()} ${c.dim}        [Parser] No handle found${c.reset}`);
-      }
-    }
-
-    // ── Twitter/X direct URL path (only if community didn't already match) ───
-    if (!entry && twitterHandle) {
-      log(`${ts()} ${c.yellow}        [Twitter]${c.reset} Handle from URL: ${twitterHandle}`);
-      const found = findEntry(twitterHandle, whitelist);
-      if (found) { entry = found; handle = twitterHandle; matchSource = 'twitter'; }
-      else log(`${ts()} ${c.dim}        [Twitter] ${twitterHandle} not in whitelist${c.reset}`);
-    }
-
-    if (!entry) {
-      log(`${ts()} ${c.dim}        [Skip] No whitelisted handle found${c.reset}`);
-      return;
-    }
-
-    log(`${ts()} ${c.green}        [Match]${c.reset} ${handle} via ${matchSource}`);
-
-    const tag         = entry.tag ?? null;
-    const pairAddress = bondingCurveKey ?? mint;
-    const axiomUrl    = `https://axiom.trade/meme/${pairAddress}?chain=sol`;
-    const cfg         = loadConfig();
-
-    // 1. CLI: sound + alert + open tab
-    if (cfg.cli_enabled) {
-      clearPromptLine();
-      playAlert();
-      printAlert(mint, pairAddress, name ?? 'Unknown', handle, tag, axiomUrl);
-      rl.prompt(true);
-      await open(axiomUrl).catch(() => {});
-    }
-
-    // 2. Telegram broadcast
-    const token = cfg.telegram?.bot_token;
-    if (token && token !== 'YOUR_BOT_TOKEN_HERE') {
-      log(`${ts()} ${c.dim}        [Telegram] Broadcasting to ${loadSubs().size} subscriber(s)…${c.reset}`);
-      await broadcast(token, name ?? 'Unknown', mint, handle, tag, axiomUrl);
-      log(`${ts()} ${c.dim}        [Telegram] Sent${c.reset}`);
-    }
+    // Hand off to queue immediately — never await here
+    enqueue(event);
   });
 
   ws.on('error', (err) => {
@@ -495,7 +540,6 @@ function startMonitor() {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 printBanner();
-if (!fs.existsSync(WHITELIST_PATH)) saveWhitelist([]);
 if (!fs.existsSync(CONFIG_PATH))    saveConfig(loadConfig());
 
 const { bot_token } = loadConfig().telegram ?? {};

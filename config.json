@@ -1,5 +1,5 @@
 {
-  "cli_enabled": true,
+  "cli_enabled": false,
   "telegram": {
     "bot_token": "8528491248:AAG_fyhMzl7IwEsOAxPtBfMZF3bjeXj-vAQ"
   }
