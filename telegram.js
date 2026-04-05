@@ -98,19 +98,37 @@ function handleWlTag(parts) {
 async function startPolling(token) {
   if (!token || token === 'YOUR_BOT_TOKEN_HERE') return;
 
-  let offset = 0;
+  let offset         = 0;
+  let backoff        = 5_000;
+  let consecutiveFails = 0;
 
   while (true) {
-    const data = await tgCall(token, 'getUpdates', {
-      offset,
-      timeout:         25,
-      allowed_updates: ['message'],
-    });
-
-    if (!data || !data.ok || !Array.isArray(data.result)) {
-      await new Promise(r => setTimeout(r, 5_000));
+    let data;
+    try {
+      data = await tgCall(token, 'getUpdates', {
+        offset,
+        timeout:         25,
+        allowed_updates: ['message'],
+      });
+    } catch (err) {
+      consecutiveFails++;
+      const wait = Math.min(backoff * consecutiveFails, 60_000);
+      console.warn(`\x1b[90m[TG Poll] Network error (${consecutiveFails}x): ${err?.message ?? err} — retrying in ${wait / 1000}s\x1b[0m`);
+      await new Promise(r => setTimeout(r, wait));
       continue;
     }
+
+    if (!data || !data.ok || !Array.isArray(data.result)) {
+      consecutiveFails++;
+      const wait = Math.min(backoff * consecutiveFails, 60_000);
+      const reason = data?.description ?? 'bad response';
+      console.warn(`\x1b[90m[TG Poll] Bad response (${consecutiveFails}x): ${reason} — retrying in ${wait / 1000}s\x1b[0m`);
+      await new Promise(r => setTimeout(r, wait));
+      continue;
+    }
+
+    // Successful poll — reset failure counter
+    consecutiveFails = 0;
 
     for (const update of data.result) {
       offset = update.update_id + 1;
@@ -122,53 +140,57 @@ async function startPolling(token) {
 
       if (!text || !chatId) continue;
 
-      const subs  = loadSubs();
-      // Strip optional @botname suffix from commands (e.g. /start@mybot)
-      const parts = text.split(/\s+/);
-      const cmd   = (parts[0] ?? '').replace(/@\S+$/, '').toLowerCase();
+      // Wrap each command handler so one bad message can't kill the loop
+      try {
+        const subs  = loadSubs();
+        const parts = text.split(/\s+/);
+        const cmd   = (parts[0] ?? '').replace(/@\S+$/, '').toLowerCase();
 
-      switch (cmd) {
-        case '/start':
-          if (!subs.has(chatId)) {
-            subs.add(chatId);
-            saveSubs(subs);
-            await reply(token, chatId,
-              `👋 Hey ${userName}! You're now subscribed to token alerts.\n\nSend /stop to unsubscribe or /help to see all commands.`
-            );
-          } else {
-            await reply(token, chatId, `✅ You're already subscribed. Send /stop to unsubscribe.`);
-          }
-          break;
+        switch (cmd) {
+          case '/start':
+            if (!subs.has(chatId)) {
+              subs.add(chatId);
+              saveSubs(subs);
+              await reply(token, chatId,
+                `👋 Hey ${userName}! You're now subscribed to token alerts.\n\nSend /stop to unsubscribe or /help to see all commands.`
+              );
+            } else {
+              await reply(token, chatId, `✅ You're already subscribed. Send /stop to unsubscribe.`);
+            }
+            break;
 
-        case '/stop':
-          if (subs.has(chatId)) {
-            subs.delete(chatId);
-            saveSubs(subs);
-            await reply(token, chatId, `👋 Unsubscribed. Send /start to resubscribe anytime.`);
-          } else {
-            await reply(token, chatId, `You're not subscribed. Send /start to subscribe.`);
-          }
-          break;
+          case '/stop':
+            if (subs.has(chatId)) {
+              subs.delete(chatId);
+              saveSubs(subs);
+              await reply(token, chatId, `👋 Unsubscribed. Send /start to resubscribe anytime.`);
+            } else {
+              await reply(token, chatId, `You're not subscribed. Send /start to subscribe.`);
+            }
+            break;
 
-        case '/help':
-          await reply(token, chatId, handleHelp());
-          break;
+          case '/help':
+            await reply(token, chatId, handleHelp());
+            break;
 
-        case '/wl_list':
-          await reply(token, chatId, handleWlList());
-          break;
+          case '/wl_list':
+            await reply(token, chatId, handleWlList());
+            break;
 
-        case '/wl_add':
-          await reply(token, chatId, handleWlAdd(parts));
-          break;
+          case '/wl_add':
+            await reply(token, chatId, handleWlAdd(parts));
+            break;
 
-        case '/wl_remove':
-          await reply(token, chatId, handleWlRemove(parts));
-          break;
+          case '/wl_remove':
+            await reply(token, chatId, handleWlRemove(parts));
+            break;
 
-        case '/wl_tag':
-          await reply(token, chatId, handleWlTag(parts));
-          break;
+          case '/wl_tag':
+            await reply(token, chatId, handleWlTag(parts));
+            break;
+        }
+      } catch (err) {
+        console.warn(`\x1b[90m[TG Poll] Command handler error: ${err?.message ?? err}\x1b[0m`);
       }
     }
   }

@@ -395,16 +395,25 @@ function enqueue(event) {
 }
 
 async function drainQueue() {
+  if (queueRunning) return; // guard against double-start
   queueRunning = true;
-  while (tokenQueue.length > 0) {
-    const event = tokenQueue.shift();
-    try {
-      await processToken(event);
-    } catch (err) {
-      log(`${ts()} ${c.red}[Queue] Unhandled error processing token: ${err.message}${c.reset}`);
+  try {
+    while (tokenQueue.length > 0) {
+      const event = tokenQueue.shift();
+      try {
+        await processToken(event);
+      } catch (err) {
+        log(`${ts()} ${c.red}[Queue] Token processing error: ${err?.message ?? err}${c.reset}`);
+      }
     }
+  } catch (err) {
+    log(`${ts()} ${c.red}[Queue] drainQueue crashed: ${err?.message ?? err}${c.reset}`);
+  } finally {
+    // Always release the lock — even if something unexpected throws
+    queueRunning = false;
+    // If items arrived while we were in the finally block, restart
+    if (tokenQueue.length > 0) drainQueue();
   }
-  queueRunning = false;
 }
 
 async function processToken(event) {
@@ -511,30 +520,56 @@ async function processToken(event) {
 
 // ─── WebSocket monitor ────────────────────────────────────────────────────────
 function startMonitor() {
+  let dead = false; // prevents double-reconnect
+
+  function kill(reason) {
+    if (dead) return;
+    dead = true;
+    log(`${ts()} ${c.yellow}[WS]${c.reset} ${reason} — reconnecting in 3s…`);
+    try { ws.terminate(); } catch { /* ignore */ }
+    setTimeout(startMonitor, 3_000);
+  }
+
   const ws = new WebSocket('wss://pumpportal.fun/api/data');
 
+  // Zombie-connection watchdog: if we go 45s without any message, assume
+  // the connection is stale and force a reconnect.
+  let lastMsgAt = Date.now();
+  const watchdog = setInterval(() => {
+    const silentMs = Date.now() - lastMsgAt;
+    if (silentMs > 45_000) {
+      log(`${ts()} ${c.yellow}[WS]${c.reset} No data for ${Math.round(silentMs / 1000)}s — forcing reconnect`);
+      clearInterval(watchdog);
+      kill('Watchdog timeout');
+    }
+  }, 10_000);
+
   ws.on('open', () => {
+    lastMsgAt = Date.now();
     ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
     log(`${ts()} ${c.green}[WS]${c.reset} Connected — subscribed to new tokens`);
   });
 
   ws.on('message', (data) => {
+    lastMsgAt = Date.now();
     let event;
     try { event = JSON.parse(data); } catch {
       log(`${ts()} ${c.red}[WS]${c.reset} Failed to parse message`);
       return;
     }
-    // Hand off to queue immediately — never await here
     enqueue(event);
   });
 
   ws.on('error', (err) => {
     log(`${ts()} ${c.red}[WS Error]${c.reset} ${err?.message ?? err}`);
+    clearInterval(watchdog);
+    kill('WebSocket error');
   });
 
-  ws.on('close', () => {
-    log(`${ts()} ${c.yellow}[WS]${c.reset} Disconnected — reconnecting in 3s…`);
-    setTimeout(startMonitor, 3_000);
+  ws.on('close', (code, reason) => {
+    clearInterval(watchdog);
+    const why = reason?.toString() || 'no reason given';
+    kill(`Closed (code ${code}: ${why})`);
   });
 }
 
